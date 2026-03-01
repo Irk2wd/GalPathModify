@@ -1,88 +1,243 @@
-import re, sys
+#!/usr/bin/env python3
+"""
+gen_proxy.py - DLL Proxy Source Generator for MinGW (32-bit)
 
-functions = []
+Usage:
+    python gen_proxy.py C:\\Windows\\SysWOW64\\winmm.dll
+    python gen_proxy.py C:\\Windows\\SysWOW64\\winmm.dll -o src/
+"""
 
-with open("helper/winmm.def", "r") as f:
-    for line in f:
-        line = line.strip()
-        # 跳过注释、空行、LIBRARY、EXPORTS
-        if (
-            not line
-            or line.startswith(";")
-            or line.startswith("LIBRARY")
-            or line == "EXPORTS"
-        ):
-            continue
-        # 跳过 NONAME（无名导出，按序号导出的，极少被调用）
-        if "NONAME" in line:
-            continue
-        # 提取函数名：取第一个 token，去掉 @N 后缀和 ; Check 注释
-        token = line.split()[0]  # "mciExecute@4" 或 "CloseDriver"
-        name = token.split("@")[0]  # "mciExecute" 或 "CloseDriver"
-        if name and name.isidentifier():
-            functions.append(name)
+import os
+import sys
+import struct
+import argparse
 
-# 去重（有些函数可能重复出现）
-functions = list(dict.fromkeys(functions))
 
-print(f"找到 {len(functions)} 个函数")
-for name in functions:
-    print(f"  {name}")
+# ============================================================
+#  PE Export Table Parser
+# ============================================================
 
-# 生成 exports.def
-with open("src/exports.def", "w") as f:
-    f.write("LIBRARY winmm\n")
-    f.write("EXPORTS\n")
-    for i, name in enumerate(functions):
-        f.write(f"    {name}=proxy_{name} @{i+1}\n")
 
-# 生成 proxy.h
-with open("src/proxy.h", "w") as f:
-    f.write("#pragma once\n")
-    f.write("#include <windows.h>\n\n")
-    f.write("bool Proxy_Init();\n")
-    f.write("void Proxy_Free();\n")
+def parse_exports(dll_path):
+    """Parse PE export table, return list of exported function names."""
+    with open(dll_path, "rb") as f:
+        data = f.read()
 
-# 生成 proxy.cpp
-with open("src/proxy.cpp", "w") as f:
-    f.write("#include <windows.h>\n")
-    f.write("#include <cstring>\n")
-    f.write('#include "proxy.h"\n\n')
+    if data[0:2] != b"MZ":
+        raise ValueError("Not a valid PE file (no MZ signature)")
 
-    f.write(f"static FARPROC g_origFuncs[{len(functions)}];\n")
-    f.write("static HMODULE g_realDll = NULL;\n\n")
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
 
-    f.write("static const char* g_funcNames[] = {\n")
-    for name in functions:
-        f.write(f'    "{name}",\n')
-    f.write("};\n\n")
+    if data[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+        raise ValueError("Not a valid PE file (no PE signature)")
 
-    f.write(f"static const int FUNC_COUNT = {len(functions)};\n\n")
+    coff_offset = pe_offset + 4
+    size_of_optional = struct.unpack_from("<H", data, coff_offset + 16)[0]
 
-    # Init
-    f.write("bool Proxy_Init() {\n")
-    f.write("    char path[MAX_PATH];\n")
-    f.write("    GetSystemDirectoryA(path, MAX_PATH);\n")
-    f.write('    strcat(path, "\\\\winmm.dll");\n')
-    f.write("    g_realDll = LoadLibraryA(path);\n")
-    f.write("    if (!g_realDll) return false;\n")
-    f.write("    for (int i = 0; i < FUNC_COUNT; i++)\n")
-    f.write("        g_origFuncs[i] = GetProcAddress(g_realDll, g_funcNames[i]);\n")
-    f.write("    return true;\n")
-    f.write("}\n\n")
+    opt_offset = coff_offset + 20
+    magic = struct.unpack_from("<H", data, opt_offset)[0]
 
-    # Free
-    f.write("void Proxy_Free() {\n")
-    f.write("    if (g_realDll) { FreeLibrary(g_realDll); g_realDll = NULL; }\n")
-    f.write("}\n\n")
+    if magic == 0x10B:
+        export_rva = struct.unpack_from("<I", data, opt_offset + 96)[0]
+        export_size = struct.unpack_from("<I", data, opt_offset + 100)[0]
+    elif magic == 0x20B:
+        export_rva = struct.unpack_from("<I", data, opt_offset + 112)[0]
+        export_size = struct.unpack_from("<I", data, opt_offset + 116)[0]
+    else:
+        raise ValueError(f"Unknown optional header magic: 0x{magic:04X}")
 
-    # 转发函数（GCC naked + 内联汇编）
-    for i, name in enumerate(functions):
-        f.write(f'extern "C" __attribute__((naked)) void proxy_{name}() {{\n')
-        f.write(f'    __asm__ __volatile__("jmp *%0" :: "m"(g_origFuncs[{i}]));\n')
-        f.write(f"}}\n\n")
+    if export_rva == 0 or export_size == 0:
+        raise ValueError("DLL has no export table")
 
-print(f"\n生成完毕:")
-print(f"  src/exports.def  ({len(functions)} 个导出)")
-print(f"  src/proxy.h")
-print(f"  src/proxy.cpp    ({len(functions)} 个转发函数)")
+    num_sections = struct.unpack_from("<H", data, coff_offset + 2)[0]
+    sections_offset = opt_offset + size_of_optional
+    sections = []
+    for i in range(num_sections):
+        sec = sections_offset + i * 40
+        virt_size = struct.unpack_from("<I", data, sec + 8)[0]
+        virt_addr = struct.unpack_from("<I", data, sec + 12)[0]
+        raw_size = struct.unpack_from("<I", data, sec + 16)[0]
+        raw_ptr = struct.unpack_from("<I", data, sec + 20)[0]
+        sections.append((virt_addr, virt_size, raw_ptr, raw_size))
+
+    def rva_to_offset(rva):
+        for vaddr, vsize, rptr, rsize in sections:
+            if vaddr <= rva < vaddr + max(vsize, rsize):
+                return rva - vaddr + rptr
+        raise ValueError(f"Cannot resolve RVA 0x{rva:08X}")
+
+    def read_string(rva):
+        off = rva_to_offset(rva)
+        end = data.index(b"\x00", off)
+        return data[off:end].decode("ascii")
+
+    exp_off = rva_to_offset(export_rva)
+    num_names = struct.unpack_from("<I", data, exp_off + 24)[0]
+    name_table_rva = struct.unpack_from("<I", data, exp_off + 32)[0]
+    name_table_off = rva_to_offset(name_table_rva)
+
+    names = []
+    for i in range(num_names):
+        name_rva = struct.unpack_from("<I", data, name_table_off + i * 4)[0]
+        name = read_string(name_rva)
+        names.append(name)
+
+    return sorted(names)
+
+
+# ============================================================
+#  Helpers
+# ============================================================
+
+
+def safe_c_name(name):
+    result = name
+    result = result.replace("@", "_at_")
+    result = result.replace("?", "_qu_")
+    result = result.replace("$", "_dl_")
+    return result
+
+
+# ============================================================
+#  Code Generation
+# ============================================================
+
+
+def gen_proxy_h(dll_name, names):
+    lines = []
+    lines.append(f"// proxy.h - Auto-generated for {dll_name}.dll")
+    lines.append(f"// Total exports: {len(names)}")
+    lines.append(f"// Generated by gen_proxy.py - DO NOT EDIT")
+    lines.append("")
+    lines.append("#pragma once")
+    lines.append("#include <windows.h>")
+    lines.append("")
+    lines.append(f'extern "C" FARPROC g_proxy_fp[{len(names)}];')
+    lines.append("")
+    lines.append("void Proxy_Init();")
+    lines.append("void Proxy_Free();")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def gen_proxy_cpp(dll_name, names):
+    lines = []
+    lines.append(f"// proxy.cpp - Auto-generated for {dll_name}.dll")
+    lines.append(f"// Total exports: {len(names)}")
+    lines.append(f"// Generated by gen_proxy.py - DO NOT EDIT")
+    lines.append("")
+    lines.append('#include "proxy.h"')
+    lines.append("#include <cstring>")
+    lines.append("")
+    lines.append(f'extern "C" {{')
+    lines.append(f"    FARPROC g_proxy_fp[{len(names)}] = {{0}};")
+    lines.append(f"}}")
+    lines.append("")
+    lines.append("static HMODULE g_hOrigDll = NULL;")
+    lines.append("")
+
+    # naked 函数：必须用 basic asm，不能用 extended asm
+    lines.append("// ---- Forwarding stubs (naked + basic asm) ----")
+    lines.append("")
+    for i, name in enumerate(names):
+        c_name = safe_c_name(name)
+        lines.append(f'extern "C" __attribute__((naked)) void proxy_{c_name}()')
+        lines.append("{")
+        lines.append(f'    __asm__("jmp *(_g_proxy_fp + {i * 4})");')
+        lines.append("}")
+        lines.append("")
+
+    # Proxy_Init
+    lines.append("void Proxy_Init()")
+    lines.append("{")
+    lines.append("    char path[MAX_PATH];")
+    lines.append("    GetSystemDirectoryA(path, MAX_PATH);")
+    lines.append(f'    strcat(path, "\\\\{dll_name}.dll");')
+    lines.append("    g_hOrigDll = LoadLibraryA(path);")
+    lines.append("    if (!g_hOrigDll) return;")
+    lines.append("")
+    for i, name in enumerate(names):
+        lines.append(f'    g_proxy_fp[{i:>3}] = GetProcAddress(g_hOrigDll, "{name}");')
+    lines.append("}")
+    lines.append("")
+
+    # Proxy_Free
+    lines.append("void Proxy_Free()")
+    lines.append("{")
+    lines.append("    if (g_hOrigDll) { FreeLibrary(g_hOrigDll); g_hOrigDll = NULL; }")
+    lines.append("}")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def gen_exports_def(dll_name, names):
+    lines = []
+    lines.append(f"LIBRARY {dll_name}")
+    lines.append("EXPORTS")
+    for i, name in enumerate(names):
+        c_name = safe_c_name(name)
+        lines.append(f"    {name}=proxy_{c_name} @{i + 1}")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ============================================================
+#  Main
+# ============================================================
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate DLL proxy source files for MinGW (32-bit)",
+        epilog=(
+            "Example:\n"
+            "  python gen_proxy.py C:\\Windows\\SysWOW64\\winmm.dll\n"
+            "  python gen_proxy.py C:\\Windows\\SysWOW64\\version.dll -o src/\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("dll", help="Path to the target DLL file")
+    parser.add_argument(
+        "-o", "--outdir", default="src", help="Output directory (default: src/)"
+    )
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.dll):
+        print(f"Error: file not found: {args.dll}")
+        sys.exit(1)
+
+    dll_basename = os.path.splitext(os.path.basename(args.dll))[0].lower()
+
+    print(f"Parsing : {args.dll}")
+    names = parse_exports(args.dll)
+    if not names:
+        print("Error: no named exports found.")
+        sys.exit(1)
+
+    print(f"DLL name: {dll_basename}.dll")
+    print(f"Exports : {len(names)} functions")
+    print()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    files = {
+        "proxy.h": gen_proxy_h(dll_basename, names),
+        "proxy.cpp": gen_proxy_cpp(dll_basename, names),
+        "exports.def": gen_exports_def(dll_basename, names),
+    }
+
+    for filename, content in files.items():
+        filepath = os.path.join(args.outdir, filename)
+        with open(filepath, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        print(f"  Written: {filepath}")
+
+    print()
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()
