@@ -3,7 +3,7 @@
 set(CMAKE_SYSTEM_NAME Windows)
 
 # 改成你自己的 MinGW 32-bit 路径
-set(MINGW32_PATH "D:/3rdparty/mingw32")
+set(MINGW32_PATH "D:/third_libs/mingw32")
 
 set(CMAKE_C_COMPILER   "${MINGW32_PATH}/bin/i686-w64-mingw32-gcc.exe")
 set(CMAKE_CXX_COMPILER "${MINGW32_PATH}/bin/i686-w64-mingw32-g++.exe")

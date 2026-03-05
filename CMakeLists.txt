@@ -27,6 +27,11 @@ target_include_directories(winmm PRIVATE
     ${MINHOOK_DIR}/include
 )
 
+target_compile_definitions(winmm PRIVATE
+    $<$<CONFIG:Debug>:GALPATHMODIFY_ENABLE_LOG=1>
+    $<$<NOT:$<CONFIG:Debug>>:GALPATHMODIFY_ENABLE_LOG=0>
+)
+
 target_compile_options(winmm PRIVATE
     -O2
 )

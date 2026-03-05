@@ -2,7 +2,7 @@
 
 ## 动机
 
-White Album 2 的存档固定写入 `C:\Users\xxx\Documents`，且不提供手动指定路径的选项。本项目通过 DLL 代理注入 + API Hook，将存档重定向到游戏本体目录下的 `save` 文件夹。
+White Album 2 的存档固定写入 `C:\\Users\\xxx\\Documents`，且不提供手动指定路径的选项。本项目通过 DLL 代理注入 + API Hook，将存档重定向到游戏本体目录下的 `save` 文件夹。
 
 ## 技术路线
 
@@ -55,7 +55,7 @@ git clone --recurse-submodules https://github.com/Irk2wd/GalPathModify.git
 cd GalPathModify
 
 # 生成代理源码
-python helper/gen_proxy.py C:\Windows\SysWOW64\winmm.dll -o src/
+python helper/gen_proxy.py C:\\Windows\\SysWOW64\\winmm.dll -o src/
 
 # 编译
 mkdir build && cd build
@@ -64,3 +64,21 @@ mingw32-make
 ```
 
 将 `build` 目录下生成的 `winmm.dll` 复制到游戏目录即可。
+## Build Type and Logging
+
+- `Debug` build: logging is enabled and writes `galpathmodify.log` in the game directory.
+- `Release` build: logging is disabled (no log file output).
+
+### Debug build
+
+```bash
+cmake -S . -B build-debug -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE=mingw32.cmake -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug
+```
+
+### Release build
+
+```bash
+cmake -S . -B build-release -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE=mingw32.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+```
